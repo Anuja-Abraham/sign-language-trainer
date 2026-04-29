@@ -24,6 +24,23 @@ DIFFICULTY_PRESETS = {
     "advanced": {"confidence": 70, "holdFrames": 28},
 }
 
+# Per-sign threshold tuning for practical accuracy without model training.
+# Negative values reduce required confidence for hard/confusable signs.
+SIGN_THRESHOLD_OFFSETS = {
+    "M": -8,
+    "N": -8,
+    "T": -8,
+    "U": -6,
+    "V": -6,
+    "R": -6,
+    "6": -8,
+    "7": -8,
+    "8": -8,
+    "9": -8,
+    "J": -10,
+    "Z": -10,
+}
+
 
 @dataclass
 class Stats:
@@ -122,7 +139,8 @@ class SessionController:
         target = self.state.target
         diff = DIFFICULTY_PRESETS[self.state.difficulty]
         threshold = round(diff["confidence"] * self.state.distance_scale)
-        hold_required = max(1, round(diff["holdFrames"] / self.state.distance_scale))
+        threshold += SIGN_THRESHOLD_OFFSETS.get(target, 0)
+        threshold = max(35, min(95, threshold))
 
         if result.sign != "-" and result.sign != self.state.previous_detected_sign:
             self._record_attempt(result.sign == target)
@@ -131,26 +149,22 @@ class SessionController:
         is_dynamic = target in DYNAMIC_SIGNS
         is_correct = result.sign == target and round(result.confidence * 100) >= threshold and (motion_ok or not is_dynamic)
         if is_correct:
-            self.state.hold_frames += 1
-            progress = min((self.state.hold_frames / hold_required) * 100, 100)
-            status = f"Hold steady... {round(progress)}%"
-            mastered = False
-            if progress >= 100:
-                self.state.hold_frames = 0
-                self.state.target_success_count += 1
-                status = f"Success {self.state.target_success_count}/3 for {target}."
-                if self.state.target_success_count >= 3:
-                    self.state.completed_signs.add(target)
-                    self.state.stats.level_completions += 1
-                    self.state.target_success_count = 0
-                    mastered = True
-                    status = f"Sign {target} mastered."
-                    if self.state.mode == Mode.CHALLENGE:
-                        self.state.stats.challenge_score += 1
-                    if self.state.mode in {Mode.QUIZ, Mode.CHALLENGE, Mode.DRILL_AE, Mode.DRILL_BD}:
-                        pool = self.resolve_target_pool_for_mode()
-                        self.set_random_target(pool)
-            return {"progress": progress, "status": status, "mastered": mastered}
+            self.state.hold_frames = 0
+            self.state.target_success_count = 0
+            self.state.completed_signs.add(target)
+            self.state.stats.level_completions += 1
+            status = f"Threshold reached for {target}. Moving to next sign."
+            auto_advanced = False
+            if self.state.mode == Mode.CHALLENGE:
+                self.state.stats.challenge_score += 1
+            if self.state.mode in {Mode.QUIZ, Mode.CHALLENGE, Mode.DRILL_AE, Mode.DRILL_BD}:
+                pool = self.resolve_target_pool_for_mode()
+                self.set_random_target(pool)
+                auto_advanced = True
+            elif self.state.mode == Mode.LEARN:
+                self.set_target(self.state.target_index + 1)
+                auto_advanced = True
+            return {"progress": 100, "status": status, "mastered": True, "auto_advanced": auto_advanced}
 
         self.state.hold_frames = 0
         return {
@@ -161,6 +175,7 @@ class SessionController:
                 else f"Practice {target} ({self.state.target_success_count}/3 completed)"
             ),
             "mastered": False,
+            "auto_advanced": False,
         }
 
     def resolve_target_pool_for_mode(self) -> Optional[List[str]]:

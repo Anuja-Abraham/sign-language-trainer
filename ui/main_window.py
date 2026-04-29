@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.request import urlretrieve
@@ -23,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.content import CONTENT_SETS, DYNAMIC_SIGNS, SIGN_GUIDE_TEXT, ensure_local_reference_assets
+from core.ai_coach import AICoach
 from core.dynamic_signs import DynamicMatcher
 from core.recognizer import DetectionResult, Recognizer
 from core.session import Mode, SessionController
@@ -43,6 +47,10 @@ class MainWindow(QMainWindow):
         self.session = SessionController()
         self.recognizer = Recognizer()
         self.dynamic_matcher = DynamicMatcher()
+        self.ai_coach = AICoach(api_key=os.getenv("GEMINI_API_KEY", "").strip())
+        self.ai_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ai-coach")
+        self.ai_future: Optional[Future] = None
+        self.last_ai_request_ts = 0.0
 
         self.cap: Optional[cv2.VideoCapture] = None
         self.hand_landmarker = self._init_hand_landmarker()
@@ -71,6 +79,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802
         self._stop_camera()
         self._persist_settings()
+        self.ai_executor.shutdown(wait=False, cancel_futures=True)
         if self.hand_landmarker is not None:
             self.hand_landmarker.close()
         super().closeEvent(event)
@@ -126,11 +135,50 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
 
+        self.left_guide = QLabel()
+        self.right_guide = QLabel()
+        for guide in (self.left_guide, self.right_guide):
+            guide.setWordWrap(True)
+            guide.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            guide.setMinimumWidth(250)
+            guide.setStyleSheet("background:#111827;color:#e5e7eb;border-radius:8px;padding:12px;")
+
+        self.left_guide.setText(
+            "Quick Start\n"
+            "1) Start Camera\n"
+            "2) Start Calibration (10s)\n"
+            "3) Match the Targeted Sign\n"
+            "4) Hold steady until threshold\n"
+            "5) App auto-moves to next sign\n\n"
+            "Tips\n"
+            "- Keep hand centered\n"
+            "- Good lighting helps\n"
+            "- Use one hand in frame"
+        )
+        self.right_guide.setText("")
+
         self.video_label = QLabel("Camera preview")
         self.video_label.setMinimumHeight(500)
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setStyleSheet("background:#111827;color:#e5e7eb;border-radius:8px;")
-        outer.addWidget(self.video_label, stretch=3)
+        self.calibration_overlay = QLabel("")
+        self.calibration_overlay.setAlignment(Qt.AlignCenter)
+        self.calibration_overlay.setStyleSheet(
+            "background:#f59e0b;color:#111827;border-radius:6px;padding:6px 10px;font-weight:600;"
+        )
+        self.calibration_overlay.setVisible(False)
+
+        video_stack = QVBoxLayout()
+        video_stack.addWidget(self.video_label, stretch=1)
+        video_stack.addWidget(self.calibration_overlay, stretch=0, alignment=Qt.AlignHCenter | Qt.AlignTop)
+        video_holder = QWidget()
+        video_holder.setLayout(video_stack)
+
+        stage_row = QHBoxLayout()
+        stage_row.addWidget(self.left_guide, stretch=1)
+        stage_row.addWidget(video_holder, stretch=3)
+        stage_row.addWidget(self.right_guide, stretch=1)
+        outer.addLayout(stage_row, stretch=3)
         self.reference_strip = QHBoxLayout()
         self.ref_prev = QLabel()
         self.ref_curr = QLabel()
@@ -200,6 +248,7 @@ class MainWindow(QMainWindow):
         self.theme_combo.addItems(["dark", "light"])
         self.dual_view_check = QCheckBox("Dual View")
         self.instructor_check = QCheckBox("Instructor Mode")
+        self.ai_coach_check = QCheckBox("AI Coach Tips")
         setup_layout.addWidget(QLabel("Difficulty"), 0, 0)
         setup_layout.addWidget(self.difficulty_combo, 0, 1)
         setup_layout.addWidget(QLabel("Content"), 1, 0)
@@ -210,6 +259,7 @@ class MainWindow(QMainWindow):
         setup_layout.addWidget(self.theme_combo, 3, 1)
         setup_layout.addWidget(self.dual_view_check, 4, 0)
         setup_layout.addWidget(self.instructor_check, 4, 1)
+        setup_layout.addWidget(self.ai_coach_check, 5, 0, 1, 2)
         controls_wrap.addWidget(setup_box)
 
         info_box = QGroupBox("Live Stats")
@@ -223,6 +273,8 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Ready")
         self.hint_label = QLabel("-")
         self.coach_label = QLabel("-")
+        self.ai_label = QLabel("-")
+        self.ai_status_label = QLabel("AI Coach: disabled")
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.ref_label = QLabel()
@@ -246,8 +298,11 @@ class MainWindow(QMainWindow):
         info_layout.addWidget(self.hint_label, 7, 1)
         info_layout.addWidget(QLabel("Coach"), 8, 0)
         info_layout.addWidget(self.coach_label, 8, 1)
-        info_layout.addWidget(self.progress, 9, 0, 1, 2)
-        info_layout.addWidget(self.ref_label, 10, 0, 1, 2)
+        info_layout.addWidget(QLabel("AI Coach"), 9, 0)
+        info_layout.addWidget(self.ai_label, 9, 1)
+        info_layout.addWidget(self.ai_status_label, 10, 0, 1, 2)
+        info_layout.addWidget(self.progress, 11, 0, 1, 2)
+        info_layout.addWidget(self.ref_label, 12, 0, 1, 2)
         controls_wrap.addWidget(info_box)
 
         self.start_camera_btn.clicked.connect(self._start_camera)
@@ -266,6 +321,8 @@ class MainWindow(QMainWindow):
         self.theme_combo.currentTextChanged.connect(self._apply_theme)
         self.dual_view_check.stateChanged.connect(self._toggle_dual_view)
         self.instructor_check.stateChanged.connect(self._toggle_instructor_mode)
+        self.ai_coach_check.stateChanged.connect(self._toggle_ai_coach)
+        self._update_right_guide()
 
     def _apply_settings(self) -> None:
         self.difficulty_combo.setCurrentText(self.settings.difficulty)
@@ -274,6 +331,7 @@ class MainWindow(QMainWindow):
         self.theme_combo.setCurrentText(self.settings.theme)
         self.dual_view_check.setChecked(self.settings.dual_view)
         self.instructor_check.setChecked(self.settings.instructor_mode)
+        self.ai_coach_check.setChecked(self.settings.ai_coach_enabled)
         self.session.set_content_set(self.settings.content_set)
         self.session.set_difficulty(self.settings.difficulty)
         self.session.state.challenge_duration = self.settings.challenge_duration
@@ -289,6 +347,7 @@ class MainWindow(QMainWindow):
             challenge_duration=int(self.challenge_duration_combo.currentText()),
             dual_view=self.dual_view_check.isChecked(),
             instructor_mode=self.instructor_check.isChecked(),
+            ai_coach_enabled=self.ai_coach_check.isChecked(),
         )
         self.settings_store.save(settings)
 
@@ -304,7 +363,8 @@ class MainWindow(QMainWindow):
         self.timer_tick.start(1000)
         self.start_camera_btn.setEnabled(False)
         self.stop_camera_btn.setEnabled(True)
-        self.status_label.setText("Camera running. Match the target sign.")
+        self.status_label.setText("Camera running. Auto-calibration started.")
+        self._start_calibration()
 
     def _stop_camera(self) -> None:
         self.camera_timer.stop()
@@ -329,6 +389,8 @@ class MainWindow(QMainWindow):
         self.calibration_seconds_left = 10
         self.calibration_samples.clear()
         self.calibration_label.setText("Calibrating... 10s")
+        self.calibration_overlay.setText("Auto-calibrating... 10s left")
+        self.calibration_overlay.setVisible(True)
         self.status_label.setText("Hold hand centered for calibration.")
 
     def _next_sign(self) -> None:
@@ -401,6 +463,14 @@ class MainWindow(QMainWindow):
         self.session.state.instructor_mode = state == Qt.Checked
         self.next_sign_btn.setEnabled(not self.session.state.instructor_mode and self.session.state.mode == Mode.LEARN)
 
+    def _toggle_ai_coach(self, state: int) -> None:
+        enabled = state == Qt.Checked
+        if enabled and not self.ai_coach.enabled:
+            self.ai_status_label.setText("AI Coach: set GEMINI_API_KEY and restart.")
+            self.ai_label.setText("-")
+            return
+        self.ai_status_label.setText("AI Coach: enabled" if enabled else "AI Coach: disabled")
+
     def _on_second_tick(self) -> None:
         if self.session.state.timed_remaining > 0:
             completed = self.session.tick_timer()
@@ -409,15 +479,18 @@ class MainWindow(QMainWindow):
         if self.calibrating:
             self.calibration_seconds_left -= 1
             self.calibration_label.setText(f"Calibrating... {max(0, self.calibration_seconds_left)}s")
+            self.calibration_overlay.setText(f"Auto-calibrating... {max(0, self.calibration_seconds_left)}s left")
             if self.calibration_seconds_left <= 0:
                 avg = sum(self.calibration_samples) / max(len(self.calibration_samples), 1)
                 self.session.set_calibration_scale(avg / 0.12 if avg else 1.0)
                 self.calibrating = False
                 self.calibration_label.setText("Calibrated")
+                self.calibration_overlay.setVisible(False)
                 self.status_label.setText("Calibration complete.")
         self._refresh_mode_labels()
 
     def _on_camera_tick(self) -> None:
+        self._poll_ai_tip_result()
         if self.cap is None:
             return
         ok, frame = self.cap.read()
@@ -441,6 +514,7 @@ class MainWindow(QMainWindow):
             motion_ok = self.dynamic_matcher.matches_motion(self.session.state.target)
             progress_info = self.session.process_result(result, motion_ok)
             self._apply_result(result, progress_info)
+            self._maybe_request_ai_tip(result, progress_info)
         else:
             self.detected_label.setText("-")
             self.accuracy_label.setText("0%")
@@ -470,6 +544,38 @@ class MainWindow(QMainWindow):
         self._refresh_mode_labels()
         self._refresh_target()
 
+    def _maybe_request_ai_tip(self, result: DetectionResult, progress_info: Dict[str, object]) -> None:
+        if not self.ai_coach_check.isChecked() or not self.ai_coach.enabled:
+            return
+        if result.sign == "-":
+            return
+        if self.ai_future and not self.ai_future.done():
+            return
+        now = time.monotonic()
+        if now - self.last_ai_request_ts < 3.5:
+            return
+        self.last_ai_request_ts = now
+        payload = {
+            "target": self.session.state.target,
+            "detected": result.sign,
+            "confidence": round(result.confidence * 100),
+            "status": str(progress_info.get("status", "")),
+            "coach_tip": self._coach_tip(self.session.state.target, result),
+        }
+        self.ai_status_label.setText("AI Coach: thinking...")
+        self.ai_future = self.ai_executor.submit(self.ai_coach.get_tip, payload)
+
+    def _poll_ai_tip_result(self) -> None:
+        if not self.ai_future or not self.ai_future.done():
+            return
+        try:
+            tip = self.ai_future.result()
+        except Exception:
+            tip = "AI coach failed. Continue with regular coach tips."
+        self.ai_label.setText(tip)
+        self.ai_status_label.setText("AI Coach: ready")
+        self.ai_future = None
+
     def _coach_tip(self, target: str, result: DetectionResult) -> str:
         m = result.meta
         if target in {"B", "4", "5"} and int(m.get("openCount", 0)) < 4:
@@ -493,7 +599,8 @@ class MainWindow(QMainWindow):
 
     def _refresh_target(self) -> None:
         target = self.session.state.target
-        self.target_label.setText(target)
+        self.target_label.setText(f"Targeted Sign: {target}")
+        self._update_right_guide()
         ref_path = self.reference_map.get(target)
         if ref_path and self.session.state.dual_view:
             pix = self._reference_pixmap(ref_path, 240, 180)
@@ -535,3 +642,21 @@ class MainWindow(QMainWindow):
         self.stop_camera_btn.setEnabled(False)
         self._refresh_mode_labels()
         self._refresh_target()
+
+    def _update_right_guide(self) -> None:
+        target = self.session.state.target
+        guide = SIGN_GUIDE_TEXT.get(target, "")
+        self.right_guide.setText(
+            f"Targeted Sign: {target}\n"
+            f"Guide: {guide}\n\n"
+            "How To Use\n"
+            "- Learn: normal practice flow\n"
+            "- Quiz: timed random signs\n"
+            "- Challenge: score in time limit\n"
+            "- Drill A/E and B/D: confusion practice\n\n"
+            "Controls\n"
+            "- Previous/Next Sign in Learn mode\n"
+            "- Instructor Mode locks manual stepping\n"
+            "- AI Coach Tips gives real-time hint\n"
+            "- Stop Camera to reset session view"
+        )

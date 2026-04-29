@@ -13,6 +13,7 @@ class AppSettings:
     challenge_duration: int = 30
     dual_view: bool = True
     instructor_mode: bool = False
+    ai_coach_enabled: bool = False
 
 
 class SettingsStore:

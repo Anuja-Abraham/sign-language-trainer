@@ -1,8 +1,9 @@
 {
   "difficulty": "intermediate",
-  "content_set": "asl-ae",
+  "content_set": "asl-az",
   "theme": "light",
   "challenge_duration": 30,
   "dual_view": true,
-  "instructor_mode": false
+  "instructor_mode": false,
+  "ai_coach_enabled": false
 }
