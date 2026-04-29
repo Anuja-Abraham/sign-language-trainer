@@ -107,3 +107,7 @@ Generated output:
 - Blank/missing reference image: restart app to regenerate local assets.
 - Camera not opening: close other apps using webcam and retry.
 - AI coach not responding: verify `GEMINI_API_KEY` and internet access.
+
+## Maintenance
+
+- Keep `.env` local and never commit API keys.
